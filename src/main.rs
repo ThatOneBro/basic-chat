@@ -14,9 +14,10 @@ async fn migrate() {
     let mut conn = rusqlite::Connection::open(format!("./{DB_NAME}.sqlite3")).unwrap();
 
     // 1️⃣ Define migrations
-    let migrations = Migrations::new(vec![M::up(
-        "CREATE TABLE users(id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE);",
-    )]);
+    let migrations = Migrations::new(vec![
+        M::up("CREATE TABLE users(id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE);"),
+        M::up("CREATE TABLE messages(id TEXT PRIMARY KEY, time INTEGER NOT NULL, user_id TEXT NOT NULL, username TEXT NOT NULL, text TEXT NOT NULL, reply_to TEXT)"),
+    ]);
 
     // Apply some PRAGMA, often better to do it outside of migrations
     conn.pragma_update_and_check(None, "journal_mode", &"WAL", |_| Ok(()))
@@ -28,12 +29,13 @@ async fn migrate() {
 
 #[tokio::main]
 async fn main() {
-    let conn = tokio_rusqlite::Connection::open("./temp.sqlite3")
-        .await
-        .unwrap();
-
     // Run any new migrations
     migrate().await;
+
+    // Set up db connection
+    let conn = tokio_rusqlite::Connection::open(format!("./{DB_NAME}.sqlite3"))
+        .await
+        .unwrap();
 
     // initialize tracing
     tracing_subscriber::fmt::init();
@@ -45,6 +47,8 @@ async fn main() {
         // `POST /users` goes to `create_user`
         .route("/users", post(create_user))
         .route("/users", get(get_users))
+        .route("/messages", post(create_message))
+        .route("/messages", get(get_messages))
         .with_state(conn);
 
     // run our app with hyper, listening globally on port 3000
@@ -113,6 +117,87 @@ async fn get_users(
     (StatusCode::OK, Json(users))
 }
 
+async fn create_message(
+    State(conn): State<tokio_rusqlite::Connection>,
+    Json(payload): Json<CreateMessage>,
+) -> (StatusCode, Json<Message>) {
+    let msg: Message = Message {
+        id: uuidv7::create(),
+        time: payload.time,
+        user_id: payload.user_id,
+        username: payload.username,
+        text: payload.text,
+        reply_to: payload.reply_to,
+    };
+
+    let msg_copy = msg.clone();
+
+    // Add user to users table
+    conn.call_unwrap(move |conn| match msg_copy.reply_to {
+        Some(reply_to) => {
+            conn.execute(
+                "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    msg_copy.id,
+                    msg_copy.time.to_string(),
+                    msg_copy.user_id,
+                    msg_copy.username,
+                    msg_copy.text,
+                    reply_to,
+                ],
+            )
+            .unwrap();
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO messages (id, time, user_id, username, text) VALUES (?, ?, ?, ?, ?)",
+                [
+                    msg_copy.id,
+                    msg_copy.time.to_string(),
+                    msg_copy.user_id,
+                    msg_copy.username,
+                    msg_copy.text,
+                ],
+            )
+            .unwrap();
+        }
+    })
+    .await;
+
+    // this will be converted into a JSON response
+    // with a status code of `201 Created`
+    (StatusCode::CREATED, Json(msg))
+}
+
+async fn get_messages(
+    State(conn): State<tokio_rusqlite::Connection>,
+) -> (StatusCode, Json<Vec<Message>>) {
+    let messages = conn
+        .call_unwrap(|conn| -> Result<Vec<Message>, Error> {
+            let mut stmt = conn.prepare("SELECT * FROM messages LIMIT 100;").unwrap();
+            let messages = stmt
+                .query_map([], |row| {
+                    Ok(Message {
+                        id: row.get(0)?,
+                        time: row.get(1)?,
+                        user_id: row.get(2)?,
+                        username: row.get(3)?,
+                        text: row.get(4)?,
+                        reply_to: row.get(5).unwrap_or(None),
+                    })
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<Message>, rusqlite::Error>>()
+                .unwrap();
+
+            Ok(messages)
+        })
+        .await
+        .unwrap();
+
+    (StatusCode::OK, Json(messages))
+}
+
 // the input to our `create_user` handler
 #[derive(Deserialize)]
 struct CreateUser {
@@ -124,4 +209,24 @@ struct CreateUser {
 struct User {
     id: String,
     username: String,
+}
+
+#[derive(Deserialize)]
+struct CreateMessage {
+    time: u64,
+    // TODO: Remove user_id and username, or potentially just validate them against values in JWT later (to extra processing)
+    user_id: String,
+    username: String,
+    text: String,
+    reply_to: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct Message {
+    id: String,
+    time: u64,
+    user_id: String,
+    username: String,
+    text: String,
+    reply_to: Option<String>,
 }

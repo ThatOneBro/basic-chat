@@ -16,5 +16,8 @@ RUN cargo build --release --bin basic-chat
 # We do not need the Rust toolchain to run the binary!
 FROM debian:bookworm-slim AS runtime
 WORKDIR /app
+RUN apt-get update -y && apt-get install -y ca-certificates fuse3 sqlite3
+COPY --from=flyio/litefs:0.5 /usr/local/bin/litefs /usr/local/bin/litefs
 COPY --from=builder /app/target/release/basic-chat /usr/local/bin
-ENTRYPOINT ["/usr/local/bin/basic-chat"]
+COPY ./litefs.yml /etc/litefs.yml
+ENTRYPOINT litefs mount

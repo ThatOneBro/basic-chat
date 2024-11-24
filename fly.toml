@@ -1,4 +1,4 @@
-# fly.toml app configuration file generated for basic-chat-ouywlw on 2024-11-24T04:49:33Z
+# fly.toml app configuration file generated for basic-chat-ouywlw on 2024-11-23T23:06:01-08:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
@@ -9,10 +9,14 @@ primary_region = 'lax'
 [build]
 
 [env]
-PORT = '8080'
+PORT = '3000'
+
+[[mounts]]
+source = 'litefs'
+destination = '/var/lib/litefs'
 
 [http_service]
-internal_port = 8080
+internal_port = 3000
 force_https = true
 auto_stop_machines = 'stop'
 auto_start_machines = true
@@ -24,7 +28,3 @@ memory = '1gb'
 cpu_kind = 'shared'
 cpus = 1
 memory_mb = 1024
-
-[mounts]
-source = "litefs"
-destination = "/var/lib/litefs"

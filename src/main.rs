@@ -4,16 +4,14 @@ use axum::{
     routing::{get, post},
     Error, Json, Router,
 };
+use dotenv::dotenv;
 use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
 use std::env;
 use tower_http::cors::CorsLayer;
 
-// Set DB_NAME here
-const DB_NAME: &'static str = "temp";
-
-async fn migrate() {
-    let mut conn = rusqlite::Connection::open(format!("./{DB_NAME}.sqlite3")).unwrap();
+async fn migrate(db_path: &String) {
+    let mut conn = rusqlite::Connection::open(db_path).unwrap();
 
     // 1️⃣ Define migrations
     let migrations = Migrations::new(vec![
@@ -31,13 +29,16 @@ async fn migrate() {
 
 #[tokio::main]
 async fn main() {
+    // Load from .env file
+    dotenv().ok();
+
+    let db_path = std::env::var("SQLITE_DB_PATH").expect("SQLITE_DB_PATH must be set in env.");
+
     // Run any new migrations
-    migrate().await;
+    migrate(&db_path).await;
 
     // Set up db connection
-    let conn = tokio_rusqlite::Connection::open(format!("./{DB_NAME}.sqlite3"))
-        .await
-        .unwrap();
+    let conn = tokio_rusqlite::Connection::open(db_path).await.unwrap();
 
     // initialize tracing
     tracing_subscriber::fmt::init();

@@ -10,6 +10,7 @@ primary_region = 'lax'
 
 [env]
 PORT = '3000'
+SQLITE_DB_PATH = '/var/lib/litefs/db.sqlite3'
 
 [[mounts]]
 source = 'litefs'

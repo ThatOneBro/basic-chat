@@ -121,6 +121,7 @@ name = "basic-chat"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "dotenv",
  "rusqlite",
  "rusqlite_migration",
  "serde",
@@ -170,6 +171,12 @@ name = "crossbeam-utils"
 version = "0.8.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22ec99545bb0ed0ea7bb9b8e1e9122ea386ff8a48c0922e43f36d45ab09e0e80"
+
+[[package]]
+name = "dotenv"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 
 [[package]]
 name = "fallible-iterator"

@@ -6,6 +6,7 @@ use axum::{
 };
 use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
+use tower_http::cors::CorsLayer;
 
 // Set DB_NAME here
 const DB_NAME: &'static str = "temp";
@@ -49,7 +50,8 @@ async fn main() {
         .route("/users", get(get_users))
         .route("/messages", post(create_message))
         .route("/messages", get(get_messages))
-        .with_state(conn);
+        .with_state(conn)
+        .layer(CorsLayer::permissive());
 
     // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();

@@ -1,14 +1,18 @@
 use axum::{
     extract::State,
     http::StatusCode,
-    routing::{get, post},
+    routing::{any, get, post},
     Error, Json, Router,
 };
 use dotenv::dotenv;
 use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+mod websocket;
 
 async fn migrate(db_path: &String) {
     let mut conn = rusqlite::Connection::open(db_path).unwrap();
@@ -16,7 +20,8 @@ async fn migrate(db_path: &String) {
     // 1️⃣ Define migrations
     let migrations = Migrations::new(vec![
         M::up("CREATE TABLE users(id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE);"),
-        M::up("CREATE TABLE messages(id TEXT PRIMARY KEY, time INTEGER NOT NULL, user_id TEXT NOT NULL, username TEXT NOT NULL, text TEXT NOT NULL, reply_to TEXT)"),
+        M::up("CREATE TABLE messages(id TEXT PRIMARY KEY, time INTEGER NOT NULL, user_id TEXT NOT NULL, username TEXT NOT NULL, text TEXT NOT NULL, reply_to TEXT);"),
+        M::up("ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'main';"),
     ]);
 
     // Apply some PRAGMA, often better to do it outside of migrations
@@ -41,7 +46,15 @@ async fn main() {
     let conn = tokio_rusqlite::Connection::open(db_path).await.unwrap();
 
     // initialize tracing
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
+                format!("tower_http=debug").into()
+            }),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
     // build our application with a route
     let app = Router::new()
@@ -52,15 +65,24 @@ async fn main() {
         .route("/users", get(get_users))
         .route("/messages", post(create_message))
         .route("/messages", get(get_messages))
+        .route("/ws", any(websocket::ws_handler))
         .with_state(conn)
         .layer(CorsLayer::permissive());
 
     let port = env::var("PORT").unwrap_or("3000".to_string());
-    // run our app with hyper, listening globally on port 3000
+    println!("Attempting to bind to port {port}...");
+
+    // run our app with hyper, listening globally on `port`
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
         .await
         .unwrap();
-    axum::serve(listener, app).await.unwrap();
+    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 // basic handler that responds with a static string
@@ -134,6 +156,7 @@ async fn create_message(
         user_id: payload.user_id,
         username: payload.username,
         text: payload.text,
+        channel: payload.channel,
         reply_to: payload.reply_to,
     };
 
@@ -143,7 +166,7 @@ async fn create_message(
     conn.call_unwrap(move |conn| match msg_copy.reply_to {
         Some(reply_to) => {
             conn.execute(
-                "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [
                     msg_copy.id,
                     msg_copy.time.to_string(),
@@ -151,19 +174,21 @@ async fn create_message(
                     msg_copy.username,
                     msg_copy.text,
                     reply_to,
+                    msg_copy.channel,
                 ],
             )
             .unwrap();
         }
         None => {
             conn.execute(
-                "INSERT INTO messages (id, time, user_id, username, text) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO messages (id, time, user_id, username, text, channel) VALUES (?, ?, ?, ?, ?, ?)",
                 [
                     msg_copy.id,
                     msg_copy.time.to_string(),
                     msg_copy.user_id,
                     msg_copy.username,
                     msg_copy.text,
+                    msg_copy.channel,
                 ],
             )
             .unwrap();
@@ -181,7 +206,9 @@ async fn get_messages(
 ) -> (StatusCode, Json<Vec<Message>>) {
     let messages = conn
         .call_unwrap(|conn| -> Result<Vec<Message>, Error> {
-            let mut stmt = conn.prepare("SELECT * FROM messages LIMIT 100;").unwrap();
+            let mut stmt = conn
+                .prepare("SELECT * FROM messages ORDER BY time DESC LIMIT 100;")
+                .unwrap();
             let messages = stmt
                 .query_map([], |row| {
                     Ok(Message {
@@ -190,7 +217,10 @@ async fn get_messages(
                         user_id: row.get(2)?,
                         username: row.get(3)?,
                         text: row.get(4)?,
+                        channel: row.get(6)?,
                         reply_to: row.get(5).unwrap_or(None),
+                        // encrypt_meta: row.get(6).unwrap_or(None),
+                        // encrypt_meta_sig: row.get(7).unwrap_or(None),
                     })
                 })
                 .unwrap()
@@ -203,6 +233,11 @@ async fn get_messages(
         .unwrap();
 
     (StatusCode::OK, Json(messages))
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+enum EncryptAlg {
+    X25519,
 }
 
 // the input to our `create_user` handler
@@ -218,6 +253,14 @@ struct User {
     username: String,
 }
 
+// #[derive(Serialize, Deserialize, Clone)]
+// struct EncryptMeta {
+//     time: u64,
+//     alg: EncryptAlg,
+//     user_id: String,
+//     public_key: String,
+// }
+
 #[derive(Deserialize)]
 struct CreateMessage {
     time: u64,
@@ -225,7 +268,16 @@ struct CreateMessage {
     user_id: String,
     username: String,
     text: String,
+    channel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     reply_to: Option<String>,
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // #[serde(default)]
+    // encrypt_meta: Option<EncryptMeta>,
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // #[serde(default)]
+    // encrypt_meta_sig: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -235,5 +287,14 @@ struct Message {
     user_id: String,
     username: String,
     text: String,
+    channel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     reply_to: Option<String>,
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // #[serde(default)]
+    // encrypt_meta: Option<EncryptMeta>,
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // #[serde(default)]
+    // encrypt_meta_sig: Option<String>,
 }

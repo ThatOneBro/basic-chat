@@ -1,18 +1,31 @@
 use axum::{
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    response::IntoResponse,
+};
+use axum::{
     extract::State,
     http::StatusCode,
     routing::{any, get, post},
     Error, Json, Router,
 };
+use axum_extra::{headers, TypedHeader};
 use dotenv::dotenv;
+use futures::{SinkExt, StreamExt};
 use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
-use std::env;
-use std::net::SocketAddr;
+use std::{
+    env,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
+use tokio::sync::{broadcast, mpsc};
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod websocket;
+//allows to extract the IP of connecting user
+use axum::extract::connect_info::ConnectInfo;
+
+mod msg;
 
 async fn migrate(db_path: &String) {
     let mut conn = rusqlite::Connection::open(db_path).unwrap();
@@ -65,17 +78,19 @@ async fn main() {
         .route("/users", get(get_users))
         .route("/messages", post(create_message))
         .route("/messages", get(get_messages))
-        .route("/ws", any(websocket::ws_handler))
-        .with_state(conn)
+        .route("/ws", any(ws_handler))
+        .with_state(Arc::new(AppState::new(conn)))
         .layer(CorsLayer::permissive());
 
-    let port = env::var("PORT").unwrap_or("3000".to_string());
+    let port = env::var("PORT")
+        .unwrap_or("3000".into())
+        .parse::<u16>()
+        .unwrap();
     println!("Attempting to bind to port {port}...");
 
     // run our app with hyper, listening globally on `port`
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-        .await
-        .unwrap();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     tracing::debug!("listening on {}", listener.local_addr().unwrap());
     axum::serve(
         listener,
@@ -91,7 +106,7 @@ async fn root() -> &'static str {
 }
 
 async fn create_user(
-    State(conn): State<tokio_rusqlite::Connection>,
+    State(state): State<Arc<AppState>>,
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
     Json(payload): Json<CreateUser>,
@@ -105,24 +120,25 @@ async fn create_user(
     let user_copy = user.clone();
 
     // Add user to users table
-    conn.call_unwrap(|conn| {
-        conn.execute(
-            "INSERT INTO users VALUES (?, ?)",
-            [user_copy.id, user_copy.username],
-        )
-        .unwrap();
-    })
-    .await;
+    state
+        .conn
+        .call_unwrap(|conn| {
+            conn.execute(
+                "INSERT INTO users VALUES (?, ?)",
+                [user_copy.id, user_copy.username],
+            )
+            .unwrap();
+        })
+        .await;
 
     // this will be converted into a JSON response
     // with a status code of `201 Created`
     (StatusCode::CREATED, Json(user))
 }
 
-async fn get_users(
-    State(conn): State<tokio_rusqlite::Connection>,
-) -> (StatusCode, Json<Vec<User>>) {
-    let users = conn
+async fn get_users(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Vec<User>>) {
+    let users = state
+        .conn
         .call_unwrap(|conn| -> Result<Vec<User>, Error> {
             let mut stmt = conn
                 .prepare("SELECT id, username FROM users LIMIT 100;")
@@ -147,10 +163,10 @@ async fn get_users(
 }
 
 async fn create_message(
-    State(conn): State<tokio_rusqlite::Connection>,
-    Json(payload): Json<CreateMessage>,
-) -> (StatusCode, Json<Message>) {
-    let msg: Message = Message {
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<msg::CreateMessage>,
+) -> (StatusCode, Json<msg::Message>) {
+    let msg: msg::Message = msg::Message {
         id: uuidv7::create(),
         time: payload.time,
         user_id: payload.user_id,
@@ -163,7 +179,7 @@ async fn create_message(
     let msg_copy = msg.clone();
 
     // Add user to users table
-    conn.call_unwrap(move |conn| match msg_copy.reply_to {
+    state.conn.call_unwrap(move |conn| match msg_copy.reply_to {
         Some(reply_to) => {
             conn.execute(
                 "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -201,17 +217,16 @@ async fn create_message(
     (StatusCode::CREATED, Json(msg))
 }
 
-async fn get_messages(
-    State(conn): State<tokio_rusqlite::Connection>,
-) -> (StatusCode, Json<Vec<Message>>) {
-    let messages = conn
-        .call_unwrap(|conn| -> Result<Vec<Message>, Error> {
+async fn get_messages(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Vec<msg::Message>>) {
+    let messages = state
+        .conn
+        .call_unwrap(|conn| -> Result<Vec<msg::Message>, Error> {
             let mut stmt = conn
                 .prepare("SELECT * FROM messages ORDER BY time DESC LIMIT 100;")
                 .unwrap();
             let messages = stmt
                 .query_map([], |row| {
-                    Ok(Message {
+                    Ok(msg::Message {
                         id: row.get(0)?,
                         time: row.get(1)?,
                         user_id: row.get(2)?,
@@ -224,7 +239,7 @@ async fn get_messages(
                     })
                 })
                 .unwrap()
-                .collect::<std::result::Result<Vec<Message>, rusqlite::Error>>()
+                .collect::<std::result::Result<Vec<msg::Message>, rusqlite::Error>>()
                 .unwrap();
 
             Ok(messages)
@@ -261,40 +276,89 @@ struct User {
 //     public_key: String,
 // }
 
-#[derive(Deserialize)]
-struct CreateMessage {
-    time: u64,
-    // TODO: Remove user_id and username, or potentially just validate them against values in JWT later (to extra processing)
-    user_id: String,
-    username: String,
-    text: String,
-    channel: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    reply_to: Option<String>,
-    // #[serde(skip_serializing_if = "Option::is_none")]
-    // #[serde(default)]
-    // encrypt_meta: Option<EncryptMeta>,
-    // #[serde(skip_serializing_if = "Option::is_none")]
-    // #[serde(default)]
-    // encrypt_meta_sig: Option<String>,
+// Reference: https://gist.github.com/hexcowboy/8ebcf13a5d3b681aa6c684ad51dd6e0c
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    user_agent: Option<TypedHeader<headers::UserAgent>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let user_agent = if let Some(TypedHeader(user_agent)) = user_agent {
+        user_agent.to_string()
+    } else {
+        String::from("Unknown browser")
+    };
+    println!("{user_agent} at {addr} connected.");
+    // finalize the upgrade process by returning upgrade callback.
+    // we can customize the callback by sending additional info such as address.
+    ws.on_upgrade(move |socket| handle_upgrade(socket, addr, state))
 }
 
-#[derive(Serialize, Clone)]
-struct Message {
-    id: String,
-    time: u64,
-    user_id: String,
-    username: String,
-    text: String,
-    channel: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    reply_to: Option<String>,
-    // #[serde(skip_serializing_if = "Option::is_none")]
-    // #[serde(default)]
-    // encrypt_meta: Option<EncryptMeta>,
-    // #[serde(skip_serializing_if = "Option::is_none")]
-    // #[serde(default)]
-    // encrypt_meta_sig: Option<String>,
+async fn handle_upgrade(socket: WebSocket, _addr: SocketAddr, state: Arc<AppState>) {
+    // split the websocket stream into a sender (sink) and receiver (stream)
+    let (mut sink, mut stream) = socket.split();
+    // create an mpsc so we can send messages to the sink from multiple threads
+    let (sender, mut receiver) = mpsc::channel::<String>(16);
+
+    // spawn a task that forwards messages from the mpsc to the sink
+    tokio::spawn(async move {
+        while let Some(message) = receiver.recv().await {
+            if sink.send(message.into()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // subscribe to the chat channel
+    let mut rx_chat = state.tx.subscribe();
+
+    // whenever a chat is sent to rx_chat, forward it to the mpsc
+    let send_task_sender = sender.clone();
+    let mut send_task = tokio::spawn(async move {
+        while let Ok(msg) = rx_chat.recv().await {
+            if send_task_sender
+                .send(format!("New message: {}", msg))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // clone the tx channel so we can send messages to it
+    let tx_chat = state.tx.clone();
+
+    // whenever a user sends a chat, send it to the tx_chat
+    let recv_task_sender = sender.clone();
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = stream.next().await {
+            let _ = tx_chat.send(format!("{}", text));
+            if recv_task_sender
+                .send(String::from("Your message has been sent"))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = (&mut send_task) => recv_task.abort(),
+        _ = (&mut recv_task) => send_task.abort(),
+    };
+}
+
+struct AppState {
+    // channel used to send messages to all connected clients
+    tx: broadcast::Sender<String>,
+    conn: tokio_rusqlite::Connection,
+}
+
+impl AppState {
+    fn new(conn: tokio_rusqlite::Connection) -> Self {
+        let (tx, _) = broadcast::channel(16);
+        Self { tx, conn }
+    }
 }

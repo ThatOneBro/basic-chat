@@ -8,7 +8,7 @@ on:
 jobs:
   deploy:
     name: Deploy app
-    runs-on: example-runnerdeploy-tqh5f-l85lq
+    runs-on: example-runnerdeploy-qtpg8-tvrrh
     concurrency: deploy-group    # optional: ensure only one action runs at a time
     steps:
       - uses: actions/checkout@v4
